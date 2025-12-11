@@ -1,3 +1,9 @@
+"""
+WeatherNow - Backend API Server
+Created by: Soham
+Copyright © 2025 Soham. All rights reserved.
+"""
+
 from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -22,6 +28,11 @@ db = client[os.environ['DB_NAME']]
 
 # Create the main app without a prefix
 app = FastAPI()
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the Weather API. Access endpoints at /api"}
+
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
@@ -160,26 +171,34 @@ async def get_weather(city: str):
                 air_quality_params = {
                     "latitude": latitude,
                     "longitude": longitude,
-                    "current": "pm2_5,pm10",
+                    "current": "pm2_5,pm10,us_aqi",
                     "timezone": "auto"
                 }
                 
                 air_response = await client.get(air_quality_url, params=air_quality_params)
                 air_response.raise_for_status()
                 air_data = air_response.json()
-                
                 if "current" in air_data:
-                    pm2_5 = air_data["current"].get("pm2_5", 0)
-                    pm10 = air_data["current"].get("pm10", 0)
+                    us_aqi = air_data["current"].get("us_aqi")
+                    if us_aqi is None:
+                        us_aqi = 0
+                        
+                    pm2_5 = air_data["current"].get("pm2_5")
+                    if pm2_5 is None:
+                        pm2_5 = 0.0
+                        
+                    pm10 = air_data["current"].get("pm10")
+                    if pm10 is None:
+                        pm10 = 0.0
                     
-                    aqi_data = calculate_aqi_from_pm(pm2_5, pm10)
+                    aqi_info = get_aqi_info(us_aqi)
                     
                     air_quality_obj = AirQuality(
-                        aqi=aqi_data["aqi"],
-                        category=aqi_data["category"],
-                        pm2_5=round(pm2_5, 1),
-                        pm10=round(pm10, 1),
-                        health_recommendation=aqi_data["recommendation"]
+                        aqi=us_aqi,
+                        category=aqi_info["category"],
+                        pm2_5=round(float(pm2_5), 1),
+                        pm10=round(float(pm10), 1),
+                        health_recommendation=aqi_info["recommendation"]
                     )
             except Exception as e:
                 logger.warning(f"Could not fetch air quality data: {e}")
@@ -331,38 +350,30 @@ def get_weather_info(code: int) -> dict:
     
     return weather_codes.get(code, {"description": "Unknown", "icon": "🌡️"})
 
-def calculate_aqi_from_pm(pm2_5: float, pm10: float) -> dict:
+def get_aqi_info(aqi: int) -> dict:
     """
-    Calculate AQI and category from PM2.5 and PM10 values using US EPA standard
+    Get category and recommendation based on US AQI value
     """
-    # Calculate AQI from PM2.5 (primary pollutant)
-    if pm2_5 <= 12.0:
-        aqi = int((50 / 12.0) * pm2_5)
+    if aqi <= 50:
         category = "Good"
         recommendation = "Air quality is satisfactory. Enjoy outdoor activities!"
-    elif pm2_5 <= 35.4:
-        aqi = int(50 + ((100 - 50) / (35.4 - 12.1)) * (pm2_5 - 12.1))
+    elif aqi <= 100:
         category = "Moderate"
         recommendation = "Air quality is acceptable. Sensitive individuals should consider reducing prolonged outdoor activities."
-    elif pm2_5 <= 55.4:
-        aqi = int(100 + ((150 - 100) / (55.4 - 35.5)) * (pm2_5 - 35.5))
+    elif aqi <= 150:
         category = "Unhealthy for Sensitive Groups"
         recommendation = "Sensitive groups should reduce prolonged or heavy outdoor activities."
-    elif pm2_5 <= 150.4:
-        aqi = int(150 + ((200 - 150) / (150.4 - 55.5)) * (pm2_5 - 55.5))
+    elif aqi <= 200:
         category = "Unhealthy"
         recommendation = "Everyone should reduce prolonged or heavy outdoor activities."
-    elif pm2_5 <= 250.4:
-        aqi = int(200 + ((300 - 200) / (250.4 - 150.5)) * (pm2_5 - 150.5))
+    elif aqi <= 300:
         category = "Very Unhealthy"
         recommendation = "Everyone should avoid prolonged outdoor activities."
     else:
-        aqi = int(300 + ((500 - 300) / (500.4 - 250.5)) * (pm2_5 - 250.5))
         category = "Hazardous"
         recommendation = "Everyone should avoid all outdoor activities."
     
     return {
-        "aqi": min(aqi, 500),
         "category": category,
         "recommendation": recommendation
     }
@@ -373,7 +384,14 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:5175",
+        "http://localhost:5176",
+        "http://localhost:3000",
+    ],
+
     allow_methods=["*"],
     allow_headers=["*"],
 )
