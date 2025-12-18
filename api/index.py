@@ -1,5 +1,5 @@
 """
-WeatherNow - Backend API Server
+WeatherNow - Backend API Server (Vercel Serverless Function)
 Created by: Soham
 Copyright © 2025 Soham. All rights reserved.
 """
@@ -19,20 +19,23 @@ import httpx
 
 
 ROOT_DIR = Path(__file__).parent
+# In Vercel, env vars are handled by the platform, but we keep this for local dev
 load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# Use get() to avoid KeyError if env vars are missing during build/initialization
+mongo_url = os.environ.get('MONGO_URL')
+db_name = os.environ.get('DB_NAME')
 
-# Create the main app without a prefix
+client = None
+db = None
+
+if mongo_url and db_name:
+    client = AsyncIOMotorClient(mongo_url)
+    db = client[db_name]
+
+# Create the main app
 app = FastAPI()
-
-@app.get("/")
-async def root():
-    return {"message": "Welcome to the Weather API. Access endpoints at /api"}
-
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
@@ -40,7 +43,7 @@ api_router = APIRouter(prefix="/api")
 
 # Define Models
 class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
+    model_config = ConfigDict(extra="ignore")
     
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     client_name: str
@@ -87,17 +90,19 @@ class ForecastResponse(BaseModel):
     current_datetime: str
     forecast_days: List[ForecastDay]
 
-# Add your routes to the router instead of directly to app
+# Routes
 @api_router.get("/")
-async def root():
+async def api_root():
     return {"message": "Weather API is running"}
 
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
+    if not db:
+        raise HTTPException(status_code=503, detail="Database connection not available")
+    
     status_dict = input.model_dump()
     status_obj = StatusCheck(**status_dict)
     
-    # Convert to dict and serialize datetime to ISO string for MongoDB
     doc = status_obj.model_dump()
     doc['timestamp'] = doc['timestamp'].isoformat()
     
@@ -106,10 +111,11 @@ async def create_status_check(input: StatusCheckCreate):
 
 @api_router.get("/status", response_model=List[StatusCheck])
 async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
+    if not db:
+        raise HTTPException(status_code=503, detail="Database connection not available")
+        
     status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
     
-    # Convert ISO string timestamps back to datetime objects
     for check in status_checks:
         if isinstance(check['timestamp'], str):
             check['timestamp'] = datetime.fromisoformat(check['timestamp'])
@@ -118,12 +124,8 @@ async def get_status_checks():
 
 @api_router.get("/weather", response_model=WeatherResponse)
 async def get_weather(city: str):
-    """
-    Fetch current weather for a given city using Open-Meteo API
-    """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Step 1: Geocoding - Get coordinates from city name
+        async with httpx.AsyncClient(timeout=10.0) as client_http:
             geocoding_url = "https://geocoding-api.open-meteo.com/v1/search"
             geo_params = {
                 "name": city,
@@ -132,7 +134,7 @@ async def get_weather(city: str):
                 "format": "json"
             }
             
-            geo_response = await client.get(geocoding_url, params=geo_params)
+            geo_response = await client_http.get(geocoding_url, params=geo_params)
             geo_response.raise_for_status()
             geo_data = geo_response.json()
             
@@ -145,7 +147,6 @@ async def get_weather(city: str):
             city_name = location["name"]
             country = location.get("country", "")
             
-            # Step 2: Get weather data
             weather_url = "https://api.open-meteo.com/v1/forecast"
             weather_params = {
                 "latitude": latitude,
@@ -154,17 +155,14 @@ async def get_weather(city: str):
                 "timezone": "auto"
             }
             
-            weather_response = await client.get(weather_url, params=weather_params)
+            weather_response = await client_http.get(weather_url, params=weather_params)
             weather_response.raise_for_status()
             weather_data = weather_response.json()
             
             current = weather_data["current"]
-            
-            # Map weather codes to descriptions and icons
             weather_code = current["weather_code"]
             weather_info = get_weather_info(weather_code)
             
-            # Step 3: Get air quality data
             air_quality_obj = None
             try:
                 air_quality_url = "https://air-quality-api.open-meteo.com/v1/air-quality"
@@ -175,21 +173,13 @@ async def get_weather(city: str):
                     "timezone": "auto"
                 }
                 
-                air_response = await client.get(air_quality_url, params=air_quality_params)
+                air_response = await client_http.get(air_quality_url, params=air_quality_params)
                 air_response.raise_for_status()
                 air_data = air_response.json()
                 if "current" in air_data:
-                    us_aqi = air_data["current"].get("us_aqi")
-                    if us_aqi is None:
-                        us_aqi = 0
-                        
-                    pm2_5 = air_data["current"].get("pm2_5")
-                    if pm2_5 is None:
-                        pm2_5 = 0.0
-                        
-                    pm10 = air_data["current"].get("pm10")
-                    if pm10 is None:
-                        pm10 = 0.0
+                    us_aqi = air_data["current"].get("us_aqi") or 0
+                    pm2_5 = air_data["current"].get("pm2_5") or 0.0
+                    pm10 = air_data["current"].get("pm10") or 0.0
                     
                     aqi_info = get_aqi_info(us_aqi)
                     
@@ -213,7 +203,7 @@ async def get_weather(city: str):
                 pressure=round(current["pressure_msl"], 1),
                 weather_description=weather_info["description"],
                 icon=weather_info["icon"],
-                visibility=None,  # Open-Meteo free tier doesn't provide visibility
+                visibility=None,
                 timestamp=current["time"],
                 air_quality=air_quality_obj
             )
@@ -221,21 +211,14 @@ async def get_weather(city: str):
     except httpx.HTTPError as e:
         logger.error(f"HTTP error occurred: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch weather data")
-    except KeyError as e:
-        logger.error(f"Key error in weather data: {e}")
-        raise HTTPException(status_code=500, detail="Invalid weather data received")
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.get("/forecast", response_model=ForecastResponse)
 async def get_forecast(city: str):
-    """
-    Fetch 6-day weather forecast for a given city using Open-Meteo API
-    """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Step 1: Geocoding - Get coordinates from city name
+        async with httpx.AsyncClient(timeout=10.0) as client_http:
             geocoding_url = "https://geocoding-api.open-meteo.com/v1/search"
             geo_params = {
                 "name": city,
@@ -244,7 +227,7 @@ async def get_forecast(city: str):
                 "format": "json"
             }
             
-            geo_response = await client.get(geocoding_url, params=geo_params)
+            geo_response = await client_http.get(geocoding_url, params=geo_params)
             geo_response.raise_for_status()
             geo_data = geo_response.json()
             
@@ -257,7 +240,6 @@ async def get_forecast(city: str):
             city_name = location["name"]
             country = location.get("country", "")
             
-            # Step 2: Get forecast data
             weather_url = "https://api.open-meteo.com/v1/forecast"
             weather_params = {
                 "latitude": latitude,
@@ -267,19 +249,17 @@ async def get_forecast(city: str):
                 "forecast_days": 7
             }
             
-            weather_response = await client.get(weather_url, params=weather_params)
+            weather_response = await client_http.get(weather_url, params=weather_params)
             weather_response.raise_for_status()
             weather_data = weather_response.json()
             
             daily = weather_data["daily"]
             
-            # Get current datetime
             from datetime import datetime as dt
             current_dt = dt.now(timezone.utc).isoformat()
             
-            # Build forecast days (skip today, get next 6 days)
             forecast_days = []
-            for i in range(1, 7):  # Skip index 0 (today), get next 6 days
+            for i in range(1, 7):
                 date_str = daily["time"][i]
                 date_obj = dt.fromisoformat(date_str)
                 day_of_week = date_obj.strftime("%A")
@@ -310,17 +290,11 @@ async def get_forecast(city: str):
     except httpx.HTTPError as e:
         logger.error(f"HTTP error occurred: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch forecast data")
-    except KeyError as e:
-        logger.error(f"Key error in forecast data: {e}")
-        raise HTTPException(status_code=500, detail="Invalid forecast data received")
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 def get_weather_info(code: int) -> dict:
-    """
-    Map WMO weather codes to descriptions and icons
-    """
     weather_codes = {
         0: {"description": "Clear sky", "icon": "☀️"},
         1: {"description": "Mainly clear", "icon": "🌤️"},
@@ -347,13 +321,9 @@ def get_weather_info(code: int) -> dict:
         96: {"description": "Thunderstorm with slight hail", "icon": "⛈️"},
         99: {"description": "Thunderstorm with heavy hail", "icon": "⛈️"},
     }
-    
     return weather_codes.get(code, {"description": "Unknown", "icon": "🌡️"})
 
 def get_aqi_info(aqi: int) -> dict:
-    """
-    Get category and recommendation based on US AQI value
-    """
     if aqi <= 50:
         category = "Good"
         recommendation = "Air quality is satisfactory. Enjoy outdoor activities!"
@@ -378,20 +348,14 @@ def get_aqi_info(aqi: int) -> dict:
         "recommendation": recommendation
     }
 
-# Include the router in the main app
+# Include the router
 app.include_router(api_router)
 
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:5175",
-        "http://localhost:5176",
-        "http://localhost:3000",
-    ],
-
+    allow_origins=["*"], # Allow all for Vercel, or specify your domain
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -405,4 +369,5 @@ logger = logging.getLogger(__name__)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    if client:
+        client.close()
