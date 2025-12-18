@@ -355,7 +355,10 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=["*"], # Allow all for Vercel, or specify your domain
+    allow_origins=[
+        "http://localhost:5173",
+        "https://weather1-sand-nine.vercel.app"
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
