@@ -352,13 +352,15 @@ def get_aqi_info(aqi: int) -> dict:
 app.include_router(api_router)
 
 # CORS configuration
+origins = [
+    "http://localhost:5173",
+    "https://weather1-sand-nine.vercel.app", # Add your EXACT Vercel URL here
+]
+
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=origins,
     allow_credentials=True,
-    allow_origins=[
-        "http://localhost:5173",
-        "https://weather1-sand-nine.vercel.app"
-    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
